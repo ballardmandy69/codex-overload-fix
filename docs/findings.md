@@ -45,8 +45,8 @@ model_provider = "openai-retry"
 base_url = "http://127.0.0.1:8787"
 wire_api = "responses"
 requires_openai_auth = true
-stream_max_retries = 20
-request_max_retries = 10
+stream_max_retries = 0
+request_max_retries = 0
 ```
 
 The shim forwards requests byte-for-byte and only retries when the overload event arrives **before any output token** is emitted. Once `response.output_text.delta` has been seen it passes the stream straight through, so nothing is generated twice. It also peeks the client socket and abandons retries if the turn was cancelled.

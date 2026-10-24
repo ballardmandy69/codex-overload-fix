@@ -1,180 +1,117 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Install the Codex overload relay as a hidden, auto-restarting background service.
-
+    Install a local relay with optional Clash HTTP/mixed proxy routing.
 .DESCRIPTION
-    Finds Python, generates hidden launchers, registers a watchdog in HKCU\...\Run
-    (no admin rights required) and prints the config.toml snippet you need to paste.
-
-.PARAMETER Port
-    Local port for the relay. Default 8787.
-
-.PARAMETER Proxy
-    Upstream proxy, e.g. http://127.0.0.1:7897. Omit if your system proxy already
-    covers chatgpt.com.
-
-.PARAMETER NoAutostart
-    Generate the launchers but do not register the watchdog to start at login.
-
+    Creates a hidden single-instance supervisor; prints the Codex configuration.
+    No proxy means direct routing; Windows system proxy settings are not imported.
+    @author lyt @date 2026-10-24
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Proxy http://127.0.0.1:7897
+    .\scripts\install.ps1 -ClashPort 7890 -PythonPath C:\Python312\python.exe
 #>
 [CmdletBinding()]
 param(
-    [int]$Port = 8787,
-    [string]$Proxy = "",
-    [switch]$NoAutostart
+    [ValidateRange(1, 65535)][int]$Port = 8787,
+    [string]$Proxy = '',
+    [ValidateRange(0, 65535)][int]$ClashPort = 0,
+    [ValidateSet('127.0.0.1', 'localhost')][string]$ClashHost = '127.0.0.1',
+    [string]$PythonPath = '',
+    [string]$StateDir = (Join-Path $env:LOCALAPPDATA 'codex-overload-fix'),
+    [switch]$NoAutostart,
+    [switch]$NoStart
 )
-
 $ErrorActionPreference = 'Stop'
-
-function Write-Step($msg) { Write-Host "  $msg" -ForegroundColor DarkGray }
-function Write-Ok($msg)   { Write-Host "  [ok] $msg" -ForegroundColor Green }
-function Write-Warn2($msg){ Write-Host "  [!!] $msg" -ForegroundColor Yellow }
-
-Write-Host ""
-Write-Host "Codex Overload Fix - installer" -ForegroundColor Cyan
-Write-Host "-----------------------------" -ForegroundColor DarkGray
-
-# ---------------------------------------------------------------- locations
-$root      = Split-Path -Parent $PSScriptRoot
-$relayPy   = Join-Path $root 'relay\relay.py'
-$stateDir  = Join-Path $env:LOCALAPPDATA 'codex-overload-fix'
-$logPath   = Join-Path $stateDir 'relay.log'
-$startVbs  = Join-Path $stateDir 'start-relay.vbs'
-$watchVbs  = Join-Path $stateDir 'watch-relay.vbs'
-$runKey    = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$runName   = 'CodexOverloadRelay'
-
-if (-not (Test-Path $relayPy)) {
-    throw "relay.py not found at $relayPy - run this from the repository's scripts\ folder."
-}
-New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
-
-# ---------------------------------------------------------------- find python
-Write-Step 'Looking for Python...'
-$python = $null
-foreach ($candidate in @('py -3', 'python', 'python3')) {
-    $parts = $candidate.Split(' ')
-    $exe = $parts[0]
-    if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) { continue }
-    try {
-        $out = & $exe @($parts[1..($parts.Count - 1)] | Where-Object { $_ }) -c "import sys;print(sys.executable)" 2>$null
-    } catch { continue }
-    if (-not $out) { continue }
-    $path = ($out | Select-Object -First 1).Trim()
-    if (-not $path -or -not (Test-Path $path)) { continue }
-    if ($path -match 'WindowsApps') { continue }   # Store stub
-    $ver = & $path -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
-    if (-not $ver) { continue }
-    $major, $minor = $ver.Trim().Split('.')
-    if ([int]$major -lt 3 -or ([int]$major -eq 3 -and [int]$minor -lt 9)) {
-        Write-Warn2 "$path is Python $ver (need 3.9+)"
-        continue
+$root = Split-Path -Parent $PSScriptRoot
+$relayPath = (Resolve-Path -LiteralPath (Join-Path $root 'relay\relay.py')).Path
+$watchPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot 'watch.ps1')).Path
+$StateDir = [IO.Path]::GetFullPath($StateDir)
+if ($Proxy -and $ClashPort) { throw 'Use -Proxy or -ClashPort, not both.' }
+if ($ClashPort) { $Proxy = 'http://' + $ClashHost + ':' + $ClashPort }
+if ($Proxy) {
+    if ($Proxy -notmatch '://') { $Proxy = 'http://' + $Proxy }
+    $proxyUri = [Uri]$Proxy
+    if ($proxyUri.Scheme -ne 'http' -or $proxyUri.Host -notin @('127.0.0.1', 'localhost', '[::1]') -or
+        $proxyUri.UserInfo -or $proxyUri.Query -or $proxyUri.Fragment -or $proxyUri.AbsolutePath -ne '/' -or
+        $proxyUri.Port -lt 1 -or $proxyUri.Port -gt 65535) {
+        throw 'Use a loopback HTTP proxy URL and the Clash HTTP/mixed port (no SOCKS/HTTPS proxy).'
     }
-    $python = $path
-    Write-Ok "Python $ver at $python"
-    break
+    if ($proxyUri.Port -eq $Port) { throw 'Relay and Clash must use different ports.' }
+    $Proxy = $proxyUri.GetLeftPart([UriPartial]::Authority)
 }
-if (-not $python) {
-    throw 'No usable Python 3.9+ found. Install from https://python.org and re-run.'
+if (-not $PythonPath) {
+    foreach ($candidate in @('py', 'python', 'python3')) {
+        $command = Get-Command $candidate -ErrorAction SilentlyContinue
+        if (-not $command -or $command.Source -match 'WindowsApps') { continue }
+        $prefix = @()
+        if ($candidate -eq 'py') { $prefix = @('-3') }
+        $found = & $command.Source @prefix -c 'import sys;print(sys.executable)' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $found) { $PythonPath = [string]($found | Select-Object -Last 1); break }
+    }
 }
-
-# ---------------------------------------------------------------- build command
-$argList = @(
-    "--port $Port",
-    "--log `"$logPath`"",
-    '--max-attempts 30',
-    '--backoff-base 1',
-    '--backoff-max 8',
-    '--total-budget 300',
-    '--commit-deadline 120'
-)
-if ($Proxy) { $argList += "--proxy $Proxy" }
-$innerCmd = '"' + $python + '" "' + $relayPy + '" ' + ($argList -join ' ')
-
-# VBS strings escape a double quote by doubling it.
-$vbsCmd = $innerCmd.Replace('"', '""')
-
-# ---------------------------------------------------------------- launcher
-$startContent = @"
-' Codex Overload Fix - hidden launcher. Generated by install.ps1, do not edit.
-Set sh = CreateObject("WScript.Shell")
-sh.Run "$vbsCmd", 0, False
-"@
-Set-Content -Path $startVbs -Value $startContent -Encoding ASCII
-Write-Ok "launcher  $startVbs"
-
-# ---------------------------------------------------------------- watchdog
-$checkCmd = "cmd /c netstat -ano | findstr ""LISTENING"" | findstr "":$Port "" >nul 2>&1"
-$watchContent = @"
-' Codex Overload Fix - watchdog. Generated by install.ps1, do not edit.
-' Runs forever with no window (wscript.exe is a GUI-subsystem host).
-Set sh = CreateObject("WScript.Shell")
-check = "$($checkCmd.Replace('"','""'))"
-cmd   = "$vbsCmd"
-
-Do
-  rc = sh.Run(check, 0, True)
-  If rc <> 0 Then
-    sh.Run cmd, 0, True
-    WScript.Sleep 3000
-  Else
-    WScript.Sleep 30000
-  End If
-Loop
-"@
-Set-Content -Path $watchVbs -Value $watchContent -Encoding ASCII
-Write-Ok "watchdog  $watchVbs"
-
-# ---------------------------------------------------------------- autostart
+if (-not $PythonPath) { throw 'Python 3.9+ required. Supply -PythonPath with a real Python executable.' }
+$PythonPath = (Resolve-Path -LiteralPath $PythonPath).Path
+& $PythonPath -c 'import sys;sys.exit(0 if sys.version_info >= (3,9) else 1)'
+if ($LASTEXITCODE -ne 0) { throw 'Python 3.9+ required.' }
+foreach ($value in @($PythonPath, $relayPath, $watchPath, $StateDir, $Proxy)) {
+    if ($value -match '["\r\n]') { throw 'Paths and proxy values cannot contain quotes or newlines.' }
+}
+$occupied = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+if ($occupied.Count) { throw "Port $Port occupied. Stop the existing relay before reinstalling." }
+if ($Proxy) {
+    $probe = New-Object Net.Sockets.TcpClient
+    try {
+        $task = $probe.ConnectAsync($proxyUri.Host.Trim('[', ']'), $proxyUri.Port)
+        if (-not $task.Wait(2000) -or -not $probe.Connected) { throw 'Clash port is not listening.' }
+    } finally { $probe.Dispose() }
+    Write-Host "Proxy: $Proxy (HTTP/mixed port must be enabled in Clash)"
+}
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+$launcher = Join-Path $StateDir 'start-relay.vbs'
+$state = @{ Port = $Port; Proxy = $Proxy; RelayPath = $relayPath; PythonPath = $PythonPath; WatchPath = $watchPath }
+$state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $StateDir 'install.json') -Encoding UTF8
+$powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$watchCommand = '"' + $powerShellPath + '" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+    $watchPath + '" -StateDir "' + $StateDir + '"'
+$vbs = 'CreateObject("WScript.Shell").Run "' + $watchCommand.Replace('"', '""') + '", 0, False'
+Set-Content -LiteralPath $launcher -Value $vbs -Encoding Unicode
+if (-not $NoStart) {
+    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + $launcher + '"') -WindowStyle Hidden
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        Start-Sleep -Milliseconds 250
+        try {
+            $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/health")
+            $request.Proxy = $null
+            $request.Timeout = 500
+            $response = $request.GetResponse()
+            try {
+                $reader = New-Object IO.StreamReader($response.GetResponseStream())
+                try { $health = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+            } finally { $response.Dispose() }
+            $listener = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener[0].OwningProcess)"
+            $ready = $health.service -eq 'codex-overload-fix' -and
+                $process.CommandLine.Contains('"' + $relayPath + '"')
+            if ($ready) { break }
+        } catch { }
+    }
+    if (-not $ready) { throw "Relay failed to start. Inspect $StateDir\watch.log and relay.log." }
+}
 if (-not $NoAutostart) {
-    $entry = 'wscript.exe "' + $watchVbs + '"'
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     New-Item -Path $runKey -Force | Out-Null
-    Set-ItemProperty -Path $runKey -Name $runName -Value $entry
-    Write-Ok "registered $runName in HKCU Run"
+    Set-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -Value ('wscript.exe "' + $launcher + '"')
 }
-
-# ---------------------------------------------------------------- start now
-Write-Step 'Starting the relay...'
-Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + $watchVbs + '"') -WindowStyle Hidden
-Start-Sleep -Seconds 4
-
-$listening = $false
-try {
-    $listening = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
-} catch {
-    $listening = [bool](netstat -ano | Select-String ":$Port\s" | Select-String 'LISTENING')
-}
-if ($listening) {
-    Write-Ok "listening on 127.0.0.1:$Port"
-} else {
-    Write-Warn2 "not listening yet - check $logPath"
-}
-
-# ---------------------------------------------------------------- config
-$configPath = Join-Path $env:USERPROFILE '.codex\config.toml'
-Write-Host ""
-Write-Host "Add this to $configPath" -ForegroundColor Cyan
-Write-Host "----------------------------------------" -ForegroundColor DarkGray
-$snippet = @"
+Write-Host "Prepared relay at 127.0.0.1:$Port; state: $StateDir"
+Write-Host 'Back up config.toml; put model_provider at the TOP LEVEL (before any [table]).'
+@"
 model_provider = "openai-retry"
 
 [model_providers.openai-retry]
-name = "OpenAI (retry)"
+name = "OpenAI (local retry)"
 base_url = "http://127.0.0.1:$Port"
 wire_api = "responses"
 requires_openai_auth = true
-stream_max_retries = 20
-request_max_retries = 10
-"@
-Write-Host $snippet -ForegroundColor White
-Write-Host "----------------------------------------" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "Keep a backup of config.toml before editing." -ForegroundColor Yellow
-Write-Host "Then fully restart Codex." -ForegroundColor Yellow
-Write-Host ""
-Write-Host "Log:     $logPath" -ForegroundColor DarkGray
-Write-Host "Stop:    powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1" -ForegroundColor DarkGray
-Write-Host ""
+stream_max_retries = 0
+request_max_retries = 0
+"@ | Write-Host

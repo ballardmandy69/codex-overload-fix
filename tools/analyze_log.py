@@ -70,7 +70,9 @@ def _field(msg, name):
 def _kind(msg):
     if "http 429" in msg:
         return "429"
-    if "server_is_overloaded" in msg or "server_overloaded" in msg:
+    if any(code in msg for code in (
+            "server_is_overloaded", "server_overloaded", "service_unavailable_error",
+            "flex_unavailable", "queue_full", "overload:")):
         return "overload"
     if "stream error" in msg or "connect/read error" in msg:
         return "conn"

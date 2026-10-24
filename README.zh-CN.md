@@ -93,10 +93,10 @@ Selected model is at capacity. Please try a different model.
 `relay/relay.py` 是一个单文件、纯标准库的 HTTP 中继。它站在 Codex 和真实端点之间，做三件事：
 
 1. **认出 overload。** 逐行解析 SSE，匹配 `server_is_overloaded`、`server_overloaded`、`service_unavailable_error`、`flex_unavailable`、`queue_full`，以及 HTTP 429/5xx。
-2. **只在 commit 之前重试。** 一旦吐出过任何 `response.output_text.delta` 或 `response.reasoning_summary_text.delta`，就直接放行原流。永远不会生成两遍。
+2. **只在 commit 之前重试。** 一旦吐出过可见 SSE 输出或工具事件，就直接放行原流，不重复提交已开始的流。
 3. **你停它就停。** 它会窥探客户端 socket，Codex 取消回合或退出时立即放弃重试，不空烧额度。
 
-其余全部字节透明：请求体（含 zstd 压缩的）、鉴权头、SSE 内容原样转发，不做任何修改。
+请求体和 SSE 内容原样转发；本地监听只接受回环 HTTP，请求会移除 hop-by-hop 头，日志不会记录 SSE 内容。
 
 ---
 
@@ -139,7 +139,7 @@ enabled = false
 ```powershell
 git clone https://github.com/NewBeeM4n/codex-overload-fix.git
 cd codex-overload-fix
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ClashPort 7890
 ```
 
 安装脚本会：
@@ -158,8 +158,8 @@ name = "OpenAI (retry)"
 base_url = "http://127.0.0.1:8787"
 wire_api = "responses"
 requires_openai_auth = true      # 复用现有 ChatGPT OAuth，不用重新登录
-stream_max_retries = 20
-request_max_retries = 10
+stream_max_retries = 0
+request_max_retries = 0
 ```
 
 重启 Codex。跑一个回合时看 `127.0.0.1:8787` 有没有 ESTABLISHED 连接，就能确认中继在工作。
@@ -171,16 +171,20 @@ request_max_retries = 10
 把代理传给中继：
 
 ```powershell
-python relay\relay.py --port 8787 --proxy http://127.0.0.1:7897 --log relay.log
+python relay\relay.py --port 8787 --clash-port 7890 --log relay.log
 ```
 
-中继必须能通过你 Codex 平时用的出口访问 `chatgpt.com`。如果机器级代理已经覆盖了，就不用加 `--proxy`。
+Clash 的 HTTP/混合端口通常是 `7890`；`7891` 通常是纯 SOCKS 端口，
+这个纯标准库本地中继不支持它。如果要直连，省略 `--clash-port`。
 
 ### 手动启动
 
 ```powershell
-python relay\relay.py --port 8787 --log relay.log --max-attempts 30 --backoff-base 1 --backoff-max 8
+python relay\relay.py --clash-port 7890 --port 8787 --log relay.log
 ```
+
+加固后的默认值：单请求最多 64 MiB、最多 8 个本地并发，只允许回环代理，
+健康检查也只监听本机。
 
 ---
 

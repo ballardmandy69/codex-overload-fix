@@ -93,10 +93,10 @@ And on a long-running thread, the app's own log reported `pre_compression_bytes 
 `relay/relay.py` is a single-file, stdlib-only HTTP shim. It sits between Codex and the real endpoint and does three things:
 
 1. **Recognises the overload.** It parses the SSE stream and matches `server_is_overloaded`, `server_overloaded`, `service_unavailable_error`, `flex_unavailable`, `queue_full`, and HTTP 429/5xx.
-2. **Retries — but only before commit.** Once any `response.output_text.delta` or `response.reasoning_summary_text.delta` has been emitted, it passes the stream straight through. Nothing is ever generated twice.
+2. **Retries — but only before commit.** Once any visible SSE output or tool event has been emitted, it passes the stream straight through. It never replays a committed stream.
 3. **Stops when you stop.** It peeks the client socket; if Codex cancelled the turn or exited, retries are abandoned instead of burning quota.
 
-Everything else is byte-transparent: request bodies (including zstd-compressed ones), auth headers and SSE payloads are forwarded untouched.
+Request bodies and SSE payloads are forwarded untouched. The local listener only accepts loopback HTTP traffic, strips hop-by-hop headers, and never logs SSE payload contents.
 
 ---
 
@@ -139,7 +139,7 @@ Deleting a remote plugin's cache does **not** work: the app re-downloads it on s
 ```powershell
 git clone https://github.com/NewBeeM4n/codex-overload-fix.git
 cd codex-overload-fix
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ClashPort 7890
 ```
 
 The installer will:
@@ -158,8 +158,8 @@ name = "OpenAI (retry)"
 base_url = "http://127.0.0.1:8787"
 wire_api = "responses"
 requires_openai_auth = true      # reuses your existing ChatGPT OAuth — no re-login
-stream_max_retries = 20
-request_max_retries = 10
+stream_max_retries = 0
+request_max_retries = 0
 ```
 
 Restart Codex. You can confirm the shim is in the path by checking that `127.0.0.1:8787` has established connections while a turn is running.
@@ -171,16 +171,21 @@ Restart Codex. You can confirm the shim is in the path by checking that `127.0.0
 Pass it to the relay:
 
 ```powershell
-python relay\relay.py --port 8787 --proxy http://127.0.0.1:7897 --log relay.log
+python relay\relay.py --port 8787 --clash-port 7890 --log relay.log
 ```
 
-The relay must reach `chatgpt.com` through whatever egress your Codex normally uses. If your machine-level proxy already covers it, omit `--proxy`.
+Clash's HTTP/mixed port is commonly `7890`; `7891` is usually SOCKS-only and is
+not supported by this stdlib-only local relay. If direct routing is intended,
+omit `--clash-port`.
 
 ### Manual start
 
 ```powershell
-python relay\relay.py --port 8787 --log relay.log --max-attempts 30 --backoff-base 1 --backoff-max 8
+python relay\relay.py --clash-port 7890 --port 8787 --log relay.log
 ```
+
+The hardened defaults cap a request at 64 MiB, allow eight concurrent local
+requests, reject non-loopback proxies, and expose only a loopback health check.
 
 ---
 

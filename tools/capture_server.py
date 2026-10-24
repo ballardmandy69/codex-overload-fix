@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 OUT = sys.argv[1]
 PORT = int(sys.argv[2])
 count = 0
+MAX_BODY = 64 << 20
+SENSITIVE_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
 
 
 def decompress(body, encoding):
@@ -31,12 +33,26 @@ def decompress(body, encoding):
 
 
 class Handler(BaseHTTPRequestHandler):
+    """Local diagnostic endpoint; request bodies remain sensitive artifacts.
+
+    @author lyt
+    @date 2026-10-24
+    """
+
     protocol_version = "HTTP/1.1"
 
     def do_POST(self):
         global count
         count += 1
-        n = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            n = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self.send_error(400, "invalid Content-Length")
+            return
+        if n < 0 or n > MAX_BODY:
+            self.send_error(413, "request body too large")
+            self.close_connection = True
+            return
         raw = self.rfile.read(n) if n else b""
         plain, enc = decompress(raw, self.headers.get("Content-Encoding"))
         base = os.path.join(OUT, f"req_{count}")
@@ -45,8 +61,8 @@ class Handler(BaseHTTPRequestHandler):
         with open(base + ".meta", "w", encoding="utf-8") as f:
             f.write(f"path={self.path}\nraw={len(raw)}\nplain={len(plain)}\nenc={enc}\n")
             for k, v in self.headers.items():
-                if k.lower() in ("authorization",):
-                    v = v[:20] + "..." + v[-8:]
+                if k.lower() in SENSITIVE_HEADERS:
+                    v = "[redacted]"
                 f.write(f"{k}: {v}\n")
 
         self.send_response(200)
@@ -93,5 +109,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 os.makedirs(OUT, exist_ok=True)
-print(f"capture server on {PORT} -> {OUT}", flush=True)
+print(f"capture server on {PORT} -> {OUT} (stores request bodies; use a throwaway directory)", flush=True)
 ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

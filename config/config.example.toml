@@ -19,10 +19,12 @@ wire_api = "responses"
 # byte-for-byte.
 requires_openai_auth = true
 
-# The relay does the real retrying; these just stop Codex from giving up early
-# on the outer stream.
-stream_max_retries = 20
-request_max_retries = 10
+# The relay owns overload retries. Keep client replay disabled so a committed
+# stream is never submitted a second time.
+stream_max_retries = 0
+request_max_retries = 0
+
+# Put model_provider at the top level, before any [table] in config.toml.
 
 # ---------------------------------------------------------------------------
 # Notes
@@ -34,5 +36,5 @@ request_max_retries = 10
 #   block. Codex returns to the built-in provider on next start.
 #
 # * If you route through a proxy, pass it to the relay instead of relying on
-#   the app:  python relay\relay.py --port 8787 --proxy http://127.0.0.1:7897
+#   the app:  python relay\relay.py --port 8787 --clash-port 7890
 # ---------------------------------------------------------------------------

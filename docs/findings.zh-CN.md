@@ -78,8 +78,8 @@ name = "OpenAI (retry)"
 base_url = "http://127.0.0.1:8787"
 wire_api = "responses"
 requires_openai_auth = true      # 复用现有 OAuth，不用重新登录
-stream_max_retries = 20
-request_max_retries = 10
+stream_max_retries = 0
+request_max_retries = 0
 ```
 
 `requires_openai_auth = true` 会让 Codex 照常带上原有的 ChatGPT Bearer token 和账号头，**套餐、用量、登录状态都不受影响** —— 中继只是多了一跳 TCP。
