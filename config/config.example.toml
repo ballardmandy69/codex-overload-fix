@@ -1,10 +1,8 @@
 # ---------------------------------------------------------------------------
-# Codex overload fix - the only lines you need to add to ~/.codex/config.toml
-#
-# Back up your config first:
-#   copy %USERPROFILE%\.codex\config.toml %USERPROFILE%\.codex\config.toml.bak
-#
-# Then restart Codex completely (quit from the tray, not just close the window).
+# 将以下内容追加到 Codex 配置文件：
+#   macOS: ~/.codex/config.toml
+#   Windows: %USERPROFILE%\.codex\config.toml
+# 修改前请先备份配置；修改后完全退出并重启 Codex。
 # ---------------------------------------------------------------------------
 
 model_provider = "openai-retry"
@@ -14,27 +12,25 @@ name = "OpenAI (retry)"
 base_url = "http://127.0.0.1:8787"
 wire_api = "responses"
 
-# Reuses the ChatGPT OAuth token Codex already has. No re-login, no plan change,
-# no separate API key. The relay forwards the Authorization and account headers
-# byte-for-byte.
+# 复用 Codex 已有的 ChatGPT OAuth，不需要重新登录，不改变套餐，也不需要单独的 API key。
+# 中继按原样转发 Authorization 和账号相关请求头。
 requires_openai_auth = true
 
-# The relay owns overload retries. Keep client replay disabled so a committed
-# stream is never submitted a second time.
+# 由中继负责 overload 重试。关闭客户端重放，避免已提交的流被再次发送。
 stream_max_retries = 0
 request_max_retries = 0
 
-# Put model_provider at the top level, before any [table] in config.toml.
+# model_provider 必须位于 config.toml 顶层，并放在其他 [table] 之前。
 
 # ---------------------------------------------------------------------------
-# Notes
+# 说明
 #
-# * `openai` is a reserved provider id and cannot be overridden. That is why
-#   this defines a new provider rather than patching the built-in one.
+# * `openai` 是 Codex 的保留 provider id，不能覆盖，因此这里定义新的 provider。
 #
-# * To roll back, delete `model_provider` and the [model_providers.openai-retry]
-#   block. Codex returns to the built-in provider on next start.
+# * 回滚时删除 `model_provider` 和 [model_providers.openai-retry] 配置块，
+#   Codex 下次启动会恢复内置 provider。
 #
-# * If you route through a proxy, pass it to the relay instead of relying on
-#   the app:  python relay\relay.py --port 8787 --clash-port 7890
+# * 如果使用 Clash，请把 HTTP/混合端口传给中继：
+#   macOS:  python3 relay/relay.py --port 8787 --clash-port 7890
+#   Windows: python relay\relay.py --port 8787 --clash-port 7890
 # ---------------------------------------------------------------------------
