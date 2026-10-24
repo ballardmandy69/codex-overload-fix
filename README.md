@@ -145,7 +145,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ClashPort 7890
 The installer will:
 
 1. Locate Python (3.9+; stdlib only, no dependencies).
-2. Register a hidden launcher and a watchdog in `HKCU\...\Run` — no admin rights, no console window.
+2. Register a hidden watchdog in Windows Task Scheduler at user logon, with restart-on-failure — it is independent of Codex's process tree and needs no admin rights.
 3. Print the `config.toml` snippet you need to paste.
 
 Then edit `%USERPROFILE%\.codex\config.toml`:

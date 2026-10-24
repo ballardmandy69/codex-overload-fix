@@ -145,7 +145,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ClashPort 7890
 安装脚本会：
 
 1. 找到 Python（3.9+，纯标准库，无依赖）。
-2. 在 `HKCU\...\Run` 里注册隐藏启动器和看门狗——不需要管理员权限，不弹控制台窗口。
+2. 在 Windows 任务计划程序中注册隐藏看门狗，用户登录时启动并在失败后重启——独立于 Codex 进程树，不需要管理员权限。
 3. 打印你需要粘贴的 `config.toml` 片段。
 
 然后编辑 `%USERPROFILE%\.codex\config.toml`：

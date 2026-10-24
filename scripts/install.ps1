@@ -3,7 +3,7 @@
 .SYNOPSIS
     Install a local relay with optional Clash HTTP/mixed proxy routing.
 .DESCRIPTION
-    Creates a hidden single-instance supervisor; prints the Codex configuration.
+    Creates a Windows Task Scheduler supervisor; prints the Codex configuration.
     No proxy means direct routing; Windows system proxy settings are not imported.
     @author lyt @date 2026-10-24
 .EXAMPLE
@@ -17,6 +17,7 @@ param(
     [ValidateSet('127.0.0.1', 'localhost')][string]$ClashHost = '127.0.0.1',
     [string]$PythonPath = '',
     [string]$StateDir = (Join-Path $env:LOCALAPPDATA 'codex-overload-fix'),
+    [string]$TaskName = 'CodexOverloadRelay',
     [switch]$NoAutostart,
     [switch]$NoStart
 )
@@ -52,7 +53,7 @@ if (-not $PythonPath) { throw 'Python 3.9+ required. Supply -PythonPath with a r
 $PythonPath = (Resolve-Path -LiteralPath $PythonPath).Path
 & $PythonPath -c 'import sys;sys.exit(0 if sys.version_info >= (3,9) else 1)'
 if ($LASTEXITCODE -ne 0) { throw 'Python 3.9+ required.' }
-foreach ($value in @($PythonPath, $relayPath, $watchPath, $StateDir, $Proxy)) {
+foreach ($value in @($PythonPath, $relayPath, $watchPath, $StateDir, $Proxy, $TaskName)) {
     if ($value -match '["\r\n]') { throw 'Paths and proxy values cannot contain quotes or newlines.' }
 }
 $occupied = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
@@ -66,16 +67,42 @@ if ($Proxy) {
     Write-Host "Proxy: $Proxy (HTTP/mixed port must be enabled in Clash)"
 }
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
-$launcher = Join-Path $StateDir 'start-relay.vbs'
-$state = @{ Port = $Port; Proxy = $Proxy; RelayPath = $relayPath; PythonPath = $PythonPath; WatchPath = $watchPath }
+$state = @{
+    Port = $Port
+    Proxy = $Proxy
+    RelayPath = $relayPath
+    PythonPath = $PythonPath
+    WatchPath = $watchPath
+    TaskName = $TaskName
+}
 $state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $StateDir 'install.json') -Encoding UTF8
 $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$watchCommand = '"' + $powerShellPath + '" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
-    $watchPath + '" -StateDir "' + $StateDir + '"'
-$vbs = 'CreateObject("WScript.Shell").Run "' + $watchCommand.Replace('"', '""') + '", 0, False'
-Set-Content -LiteralPath $launcher -Value $vbs -Encoding Unicode
+$taskArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $watchPath +
+    '" -StateDir "' + $StateDir + '"'
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+if (-not $NoAutostart) {
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $legacyEntry = Get-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -ErrorAction SilentlyContinue
+    if ($legacyEntry -and $legacyEntry.CodexOverloadRelay.Contains('start-relay.vbs')) {
+        Remove-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -ErrorAction SilentlyContinue
+    }
+    $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $taskArgs
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopOnIdleEnd `
+        -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description `
+        'Local Codex overload relay supervisor' -Force | Out-Null
+}
 if (-not $NoStart) {
-    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + $launcher + '"') -WindowStyle Hidden
+    if ($NoAutostart) {
+        $startAction = $powerShellPath
+        $startArgs = $taskArgs
+        Start-Process -FilePath $startAction -ArgumentList $startArgs -WindowStyle Hidden
+    } else {
+        Start-ScheduledTask -TaskName $TaskName
+    }
     $ready = $false
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
         Start-Sleep -Milliseconds 250
@@ -97,12 +124,8 @@ if (-not $NoStart) {
     }
     if (-not $ready) { throw "Relay failed to start. Inspect $StateDir\watch.log and relay.log." }
 }
-if (-not $NoAutostart) {
-    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-    New-Item -Path $runKey -Force | Out-Null
-    Set-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -Value ('wscript.exe "' + $launcher + '"')
-}
 Write-Host "Prepared relay at 127.0.0.1:$Port; state: $StateDir"
+if (-not $NoAutostart) { Write-Host "Task Scheduler task: $TaskName (AtLogOn, restart on failure)" }
 Write-Host 'Back up config.toml; put model_provider at the TOP LEVEL (before any [table]).'
 @"
 model_provider = "openai-retry"

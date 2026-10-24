@@ -108,7 +108,7 @@ COMMIT = {
 2. **退避带抖动。** 1 秒起、上限 8 秒、乘 1.6 递增并加 0.7~1.3 的随机抖动，最多 30 次 / 300 秒预算。
 3. **客户端走了就停。** 用 `select` + `MSG_PEEK` 探测本地 socket，Codex 取消或退出时立即放弃重试，不空烧额度。
 
-> Windows 注意两点：`schtasks` 建计划任务需要管理员权限，普通账户用 `HKCU\...\Run` 更省事；`powershell -WindowStyle Hidden` 挡不住控制台窗口，必须用 `wscript` + `SW_HIDE` 起一个 VBS 启动器。
+> Windows 安装使用当前用户的任务计划程序登录触发器，不依赖 Codex 进程树；任务设置了失败重启。旧版 VBS + `HKCU\...\Run` 只在用户登录时触发，无法覆盖 Codex 重启场景。
 
 ---
 
@@ -208,7 +208,7 @@ COMMIT = {
 
 1. 写一个本地中继，监听 `127.0.0.1:8787`，转发到 `chatgpt.com/backend-api/codex`。
 2. 在 `config.toml` 里加自定义 provider，并把 `model_provider` 指过去（改前备份）。
-3. Windows 用 VBS + `HKCU\...\Run` 做无窗自启，再加一个每 30 秒检查端口的看门狗。
+3. Windows 用任务计划程序在用户登录时启动独立看门狗，并在 relay 退出或看门狗失败时自动恢复。
 4. 砍掉不用的技能和插件；记忆块按需保留。
 5. 老会话换成新会话 —— 这是单项收益最大的一步。
 

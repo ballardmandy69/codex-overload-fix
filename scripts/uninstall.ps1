@@ -12,11 +12,18 @@ if (-not (Test-Path -LiteralPath $manifest)) {
     throw 'Installation manifest missing; refusing broad process termination.'
 }
 $state = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+$taskName = if ($state.TaskName) { [string]$state.TaskName } else { 'CodexOverloadRelay' }
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $entry = Get-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -ErrorAction SilentlyContinue
 $launcher = '"' + (Join-Path $StateDir 'start-relay.vbs') + '"'
-if ($entry -and $entry.CodexOverloadRelay.Contains($launcher)) {
+if ($entry -and $entry.CodexOverloadRelay.Contains('start-relay.vbs')) {
     Remove-ItemProperty -Path $runKey -Name 'CodexOverloadRelay'
+}
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($task -and $task.Actions.Arguments.Contains($state.WatchPath) -and
+    $task.Actions.Arguments.Contains($StateDir)) {
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 $processes = @(Get-CimInstance Win32_Process)
 foreach ($process in $processes) {
@@ -37,7 +44,7 @@ foreach ($process in $processes) {
 if ($Purge) {
     $resolved = (Resolve-Path -LiteralPath $StateDir).Path.TrimEnd('\')
     if ($resolved -ne $StateDir -or $resolved -eq [IO.Path]::GetPathRoot($resolved).TrimEnd('\') -or
-        -not (Test-Path -LiteralPath (Join-Path $resolved 'start-relay.vbs')) -or
+        -not (Test-Path -LiteralPath (Join-Path $resolved 'install.json')) -or
         ((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         throw 'Unsafe purge directory; remove generated files manually.'
     }
