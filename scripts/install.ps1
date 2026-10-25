@@ -77,7 +77,7 @@ $state = @{
 }
 $state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $StateDir 'install.json') -Encoding UTF8
 $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$taskArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $watchPath +
+$taskArgs = '-WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $watchPath +
     '" -StateDir "' + $StateDir + '"'
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 if (-not $NoAutostart) {
