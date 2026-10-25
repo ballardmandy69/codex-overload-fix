@@ -47,6 +47,15 @@ OVERLOAD_CODES = {
     "queue_full",
 }
 
+CLOUDFLARE_403_MAX_ATTEMPTS = 3
+CLOUDFLARE_MARKERS = (
+    b"blocked-icon",
+    b"cf-ray",
+    b"cloudflare",
+    b"just a moment",
+    b"access denied",
+)
+
 
 def is_overload(err):
     if not isinstance(err, dict):
@@ -60,6 +69,22 @@ def is_overload(err):
         or "at capacity" in msg
         or "overloaded" in msg
     )
+
+
+def is_cloudflare_block(status, headers, body):
+    """Recognize a transient Cloudflare HTML block without retrying generic 403 responses."""
+    if status != 403 or not isinstance(body, bytes):
+        return False
+    content_type = next(
+        (str(value).lower() for key, value in headers.items() if key.lower() == "content-type"),
+        "",
+    )
+    html = "text/html" in content_type or b"<html" in body[:4096].lower()
+    if not html:
+        return False
+    header_text = " ".join(f"{key}:{value}" for key, value in headers.items()).lower().encode()
+    haystack = body.lower() + header_text
+    return any(marker in haystack for marker in CLOUDFLARE_MARKERS)
 
 LOG_LOCK = threading.Lock()
 LOG_SIZE = [0]
@@ -269,8 +294,9 @@ class ConnectionWatch:
 def attempt(path, headers, body, timeout, commit_by, cancelled=lambda: False):
     """Return mode/status/headers/body/connection/response for one attempt.
 
-    Only explicit overload responses retry. Transport failures have an unknown
-    upstream execution outcome and are surfaced without replaying the POST.
+    Only explicit overload and recognized Cloudflare block responses retry.
+    Transport failures have an unknown upstream execution outcome and are
+    surfaced without replaying the POST.
     """
     conn = upstream_connection(timeout)
     retained = False
@@ -286,6 +312,8 @@ def attempt(path, headers, body, timeout, commit_by, cancelled=lambda: False):
                     return "passthrough", 502, {}, b"relay: upstream error too large\n", None, None
                 if resp.status in (429, 500, 502, 503, 504):
                     return "retry", resp.status, response_headers, data, None, f"http {resp.status}"
+                if is_cloudflare_block(resp.status, response_headers, data):
+                    return "retry", resp.status, response_headers, data, None, "cloudflare_403"
                 return "passthrough", resp.status, response_headers, data, None, None
             content_type = resp.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
             encoding = resp.getheader("Content-Encoding", "identity").strip().lower()
@@ -444,6 +472,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             last = (status, resp_headers, prelude)
             log(f"[{cport}] attempt {attempt_no}: retryable ({resp})")
+            if resp == "cloudflare_403" and attempt_no >= CLOUDFLARE_403_MAX_ATTEMPTS:
+                log(f"[{cport}] Cloudflare 403 retry limit reached; passthrough")
+                self._send_simple(status, resp_headers, prelude)
+                return
             if attempt_no == ARGS.max_attempts:
                 break
             delay = min(ARGS.backoff_max, ARGS.backoff_base * (1.6 ** min(attempt_no - 1, 100)))

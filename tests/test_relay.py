@@ -24,6 +24,16 @@ class RelayUnitTest(unittest.TestCase):
         self.assertEqual(verdict, "retry")
         self.assertIn("server_is_overloaded", info)
 
+    def test_cloudflare_html_403_is_retryable(self):
+        body = b"<html><div class='blocked-icon'>Access denied</div></html>"
+        headers = {"Content-Type": "text/html; charset=utf-8", "CF-Ray": "abc-HKG"}
+        self.assertTrue(relay.is_cloudflare_block(403, headers, body))
+
+    def test_generic_403_is_not_retryable(self):
+        body = b'{"error":"invalid authentication"}'
+        headers = {"Content-Type": "application/json"}
+        self.assertFalse(relay.is_cloudflare_block(403, headers, body))
+
     def test_reasoning_and_tool_events_commit(self):
         for kind in (
             "response.reasoning_summary_text.delta",
