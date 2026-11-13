@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-<# Remove only processes owned by this local installation. @author lyt @date 2026-10-24 #>
+<# Remove only processes owned by this local installation. @author lyt @date 2026-11-14 #>
 [CmdletBinding()]
 param(
     [string]$StateDir = (Join-Path $env:LOCALAPPDATA 'codex-overload-fix'),
@@ -16,12 +16,22 @@ $taskName = if ($state.TaskName) { [string]$state.TaskName } else { 'CodexOverlo
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $entry = Get-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -ErrorAction SilentlyContinue
 $launcher = '"' + (Join-Path $StateDir 'start-relay.vbs') + '"'
-if ($entry -and $entry.CodexOverloadRelay.Contains('start-relay.vbs')) {
+if ($entry -and $entry.CodexOverloadRelay.Contains($launcher)) {
     Remove-ItemProperty -Path $runKey -Name 'CodexOverloadRelay'
 }
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($task -and $task.Actions.Arguments.Contains($state.WatchPath) -and
-    $task.Actions.Arguments.Contains($StateDir)) {
+$ownedActions = @()
+if ($task) {
+    $ownedActions = @($task.Actions | Where-Object {
+        $arguments = [string]$_.Arguments
+        $executable = [IO.Path]::GetFileName([string]$_.Execute)
+        $legacyWatch = $executable -in @('powershell.exe', 'pwsh.exe') -and
+            $arguments.Contains('"' + $state.WatchPath + '"') -and $arguments.Contains('"' + $StateDir + '"')
+        $hiddenLauncher = $executable -in @('wscript.exe', 'cscript.exe') -and $arguments.Contains($launcher)
+        $legacyWatch -or $hiddenLauncher
+    })
+}
+if ($task -and $ownedActions.Count -gt 0 -and $ownedActions.Count -eq @($task.Actions).Count) {
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }

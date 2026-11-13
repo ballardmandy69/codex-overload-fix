@@ -5,7 +5,7 @@
 .DESCRIPTION
     Creates a Windows Task Scheduler supervisor; prints the Codex configuration.
     No proxy means direct routing; Windows system proxy settings are not imported.
-    @author lyt @date 2026-10-24
+    @author lyt @date 2026-11-14
 .EXAMPLE
     .\scripts\install.ps1 -ClashPort 7890 -PythonPath C:\Python312\python.exe
 #>
@@ -45,8 +45,14 @@ if (-not $PythonPath) {
         if (-not $command -or $command.Source -match 'WindowsApps') { continue }
         $prefix = @()
         if ($candidate -eq 'py') { $prefix = @('-3') }
-        $found = & $command.Source @prefix -c 'import sys;print(sys.executable)' 2>$null
-        if ($LASTEXITCODE -eq 0 -and $found) { $PythonPath = [string]($found | Select-Object -Last 1); break }
+        $found = & $command.Source @prefix -c `
+            'import json,sys;print(json.dumps(sys.executable,ensure_ascii=True))' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $found) {
+            try {
+                $decodedPath = ($found | Select-Object -Last 1) | ConvertFrom-Json -ErrorAction Stop
+                if ($decodedPath -is [string] -and $decodedPath) { $PythonPath = $decodedPath; break }
+            } catch { }
+        }
     }
 }
 if (-not $PythonPath) { throw 'Python 3.9+ required. Supply -PythonPath with a real Python executable.' }
@@ -67,39 +73,50 @@ if ($Proxy) {
     Write-Host "Proxy: $Proxy (HTTP/mixed port must be enabled in Clash)"
 }
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+$powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+$launcherPath = Join-Path $StateDir 'start-relay.vbs'
+$watchArgs = '-WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $watchPath +
+    '" -StateDir "' + $StateDir + '"'
+$launcherCommand = ('"' + $powerShellPath + '" ' + $watchArgs).Replace('"', '""')
+@"
+' Hidden local relay launcher. @author lyt @date 2026-11-14
+Option Explicit
+Dim shell, exitCode
+Set shell = CreateObject("WScript.Shell")
+exitCode = shell.Run("$launcherCommand", 0, True)
+WScript.Quit exitCode
+"@ | Set-Content -LiteralPath $launcherPath -Encoding Unicode
 $state = @{
     Port = $Port
     Proxy = $Proxy
     RelayPath = $relayPath
     PythonPath = $PythonPath
     WatchPath = $watchPath
+    LauncherPath = $launcherPath
     TaskName = $TaskName
 }
 $state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $StateDir 'install.json') -Encoding UTF8
-$powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$taskArgs = '-WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $watchPath +
-    '" -StateDir "' + $StateDir + '"'
+$taskArgs = '//B //NoLogo "' + $launcherPath + '"'
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 if (-not $NoAutostart) {
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $legacyEntry = Get-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -ErrorAction SilentlyContinue
-    if ($legacyEntry -and $legacyEntry.CodexOverloadRelay.Contains('start-relay.vbs')) {
+    if ($legacyEntry -and $legacyEntry.CodexOverloadRelay.Contains('"' + $launcherPath + '"')) {
         Remove-ItemProperty -Path $runKey -Name 'CodexOverloadRelay' -ErrorAction SilentlyContinue
     }
-    $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $taskArgs
+    $action = New-ScheduledTaskAction -Execute $wscriptPath -Argument $taskArgs
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
     $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopOnIdleEnd `
         -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description `
-        'Local Codex overload relay supervisor' -Force | Out-Null
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
+        -Settings $settings -Description 'Local Codex overload relay supervisor' -Force | Out-Null
 }
 if (-not $NoStart) {
     if ($NoAutostart) {
-        $startAction = $powerShellPath
-        $startArgs = $taskArgs
-        Start-Process -FilePath $startAction -ArgumentList $startArgs -WindowStyle Hidden
+        Start-Process -FilePath $wscriptPath -ArgumentList $taskArgs -WindowStyle Hidden
     } else {
         Start-ScheduledTask -TaskName $TaskName
     }
