@@ -16,6 +16,24 @@ class FakeHandler:
 
 
 class RelayUnitTest(unittest.TestCase):
+    def test_exponential_backoff_doubles_and_caps_with_jitter(self):
+        with patch.object(relay.random, "uniform", return_value=1):
+            self.assertEqual([relay.retry_delay(i, 0.5, 4) for i in range(1, 7)],
+                             [0.5, 1, 2, 4, 4, 4])
+        with patch.object(relay.random, "uniform", return_value=1.3):
+            self.assertEqual(relay.retry_delay(10, 0.5, 4), 4)
+            self.assertEqual(relay.retry_delay(1, 0.5, 4), 0.65)
+
+    def test_retry_after_seconds_dates_and_invalid_values(self):
+        with patch.object(relay.random, "uniform", return_value=1), \
+                patch.object(relay.time, "time", return_value=0):
+            self.assertEqual(relay.retry_delay(1, 0.5, 4, " 2 "), 2)
+            self.assertEqual(relay.retry_delay(1, 0.5, 4, "Thu, 01 Jan 1970 00:00:03 GMT"), 3)
+            self.assertIsNone(relay.retry_delay(1, 0.5, 4, "5"))
+            self.assertIsNone(relay.retry_delay(1, 0.5, 4, "Thu, 01 Jan 1970 00:00:05 GMT"))
+            self.assertEqual(relay.retry_delay(1, 0.5, 4, "invalid"), 0.5)
+            self.assertEqual(relay.retry_delay(1, 0.5, 4, "Thu, 01 Jan 1970 00:00:00 GMT"), 0.5)
+
     def test_overload_is_retryable(self):
         payload = json.dumps({
             "type": "error",

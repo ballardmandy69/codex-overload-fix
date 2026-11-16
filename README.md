@@ -73,16 +73,24 @@ chatgpt.com/backend-api/codex
 2. 向官方端点发起一次请求。
 3. 如果返回 429/500/502/503/504、上游连接短暂中断，或 HTTP 200 的 SSE 中先出现 `response.failed` / `error` 且错误命中 overload 判断，则关闭本次上游连接并重试。
 4. 空的输出项、内容块和心跳继续缓冲；看到正文、推理文本、工具参数、完整工具调用、未知事件或非 overload 错误时提交，后续不再重放，避免重复生成。
-5. 退避从约 0.2 秒开始，乘 1.6 并加入随机抖动，单次最多等待 0.5 秒；默认最多 10 次、提交前总预算 20 秒。
+5. 临时错误统一指数退避：基准 0.5、1、2、4 秒，加入 0.7～1.3 倍随机抖动，单次等待不超过 4 秒；默认最多 10 次、提交前总预算 60 秒。
 6. 如果 Codex 已取消请求或关闭本地连接，中继立即停止等待和重试。
 
-上游明确要求的 `Retry-After` 若超过单次退避上限，中继直接返回该失败，避免长时间空等或提前重试。
+`Retry-After` 支持秒数和 HTTP 日期；若超过单次退避上限或剩余总预算，中继直接返回该失败，避免长时间空等或提前重试。传输类 502 也执行退避，不再立即重发；输出开始后仍禁止自动重放。
 
 缺少 `Content-Type` 的未压缩响应会先检查最多 8 KiB 的前缀；识别为 SSE 后补齐响应类型，
-按事件处理并在提交边界及时转发，不再等整条响应结束。单次最多等待 20 秒出现实际输出，
-普通请求的所有提交前尝试共享 20 秒总预算。提交后连续 30 秒没有输出进展会断开且不重放，
+按事件处理并在提交边界及时转发，不再等整条响应结束。单次最多等待 60 秒出现实际输出，
+普通请求的所有提交前尝试共享 60 秒总预算。提交后连续 30 秒没有输出进展会断开且不重放，
 心跳、空占位事件不重置这个期限；正常输出持续到达时会刷新期限，不限制整条响应的总时长。
 可用 `--commit-deadline`、`--total-budget`、`--stream-idle-timeout` 调整这些期限。
+
+性能诊断不记录正文或凭证：`attempt timing` 按每次尝试记录连接（含代理/TLS）、
+上传、等待响应头和响应头后的耗时；`first text observed` 记录本请求开始至观察到
+首个非空 `response.output_text.delta` 的时间，不将推理摘要或工具调用当作正文。
+`stream timing` 记录流阶段的最大进展间隔、距最后进展时间、累计上游读取等待、
+事件解析耗时、累计及最大单次下游写入耗时。下游写入只表示交给本机客户端，
+不代表界面渲染完成；压缩编码或停止事件检查时，首正文显示 `unavailable`，
+进展按字节到达计算。这些指标用于定位瓶颈，不作为模型生成速度的直接测量。
 较短期限也可能结束长时间没有输出的正常推理。
 
 上下文压缩使用独立的 120 秒提交前预算与 120 秒输出停滞期限，可通过 `--compaction-timeout` 调整。
@@ -105,7 +113,7 @@ HTTP 编码压缩的响应原样流式转发，空闲期限按收到的字节刷
 原始内容继续透传；JSON 和压缩响应标记 `inspection=opaque`。
 
 这部分借鉴了上游的[流结束诊断](https://github.com/NewBeeM4n/codex-overload-fix/commit/b5ab2f25627d023b00003ebe466fbbdca085b49d)，
-并保留本地的 20 秒提交前预算、30 秒输出停滞期限和提交前有限连接重试。
+并保留本地的 60 秒提交前预算、30 秒输出停滞期限和提交前有限连接重试。
 
 ## 配置 Codex
 
@@ -148,7 +156,24 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -ClashPort 7890
 Python 自动检测使用 ASCII JSON 传递解释器路径，兼容中文用户名和带空格的路径。
 这些安装兼容性修复参考了上游实现，并沿用本项目的任务计划程序和状态目录。
 
-不使用 Clash 时省略 `-ClashPort`。卸载：
+不使用 Clash 时省略 `-ClashPort`。
+
+### Windows 快捷开关
+
+完成安装并配置 `openai-retry` 后，运行以下命令创建桌面快捷方式：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\switch.ps1 -CreateShortcuts
+```
+
+- `Codex Direct`：恢复官方直连，停用本安装的中继和开机自启，保留安装供下次开启。
+- `Codex Relay`：启用中继和开机自启，确认本安装的健康检查通过后才修改请求地址。
+- 切换后完全退出并重新打开 Codex；已运行的客户端可能继续使用旧地址。
+- 配置修改前自动在原目录生成 `config.toml.before-switch-*.bak`；操作记录在状态目录 `switch.log`。
+- 仅支持当前启用的 `openai-retry` 提供商；未知地址或其他提供商会拒绝修改。
+- 命令行可用 `scripts\switch.ps1 -Mode Direct` 或 `-Mode Relay`，支持 `-ConfigPath`、`-StateDir`。
+
+卸载：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1

@@ -3,9 +3,11 @@
 [CmdletBinding()]
 param(
     [string]$StateDir = (Join-Path $env:LOCALAPPDATA 'codex-overload-fix'),
-    [switch]$Purge
+    [switch]$Purge,
+    [switch]$KeepTask
 )
 $ErrorActionPreference = 'Stop'
+if ($KeepTask -and $Purge) { throw 'KeepTask and Purge cannot be combined.' }
 $StateDir = [IO.Path]::GetFullPath($StateDir).TrimEnd('\')
 $manifest = Join-Path $StateDir 'install.json'
 if (-not (Test-Path -LiteralPath $manifest)) {
@@ -32,8 +34,9 @@ if ($task) {
     })
 }
 if ($task -and $ownedActions.Count -gt 0 -and $ownedActions.Count -eq @($task.Actions).Count) {
+    if ($KeepTask) { Disable-ScheduledTask -TaskName $taskName | Out-Null }
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    if (-not $KeepTask) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false }
 }
 $processes = @(Get-CimInstance Win32_Process)
 foreach ($process in $processes) {
@@ -60,4 +63,5 @@ if ($Purge) {
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
-Write-Host 'Stopped this installation. Restore your previous top-level model_provider in config.toml.'
+if ($KeepTask) { Write-Host 'Stopped this installation; autostart disabled and task retained.' }
+else { Write-Host 'Stopped this installation. Restore your previous top-level model_provider in config.toml.' }

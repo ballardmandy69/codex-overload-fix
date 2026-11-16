@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import re
 import threading
 import time
 import unittest
@@ -18,7 +19,7 @@ def event(kind, **fields):
 
 
 @contextmanager
-def upstream(chunks, hold=False, content_type=None, retry_after=None):
+def upstream(chunks, hold=False, content_type=None, retry_after=None, chunked=False):
     """Serve controlled chunks and optionally keep the response open."""
     release = threading.Event()
     calls = []
@@ -34,6 +35,8 @@ def upstream(chunks, hold=False, content_type=None, retry_after=None):
                 self.send_header("Content-Type", content_type)
             if retry_after:
                 self.send_header("Retry-After", retry_after)
+            if chunked:
+                self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             try:
                 response_chunks = chunks(len(calls)) if callable(chunks) else chunks
@@ -127,6 +130,43 @@ class StreamingTest(unittest.TestCase):
             self.assertEqual(result[0], "stream")
             self.assertEqual(result[3], payload)
 
+    def test_timing_distinguishes_tool_output_from_text_and_omits_content(self):
+        tool = event("response.function_call_arguments.delta", delta="private-tool-arguments")
+        text = event("response.output_text.delta", delta="private-body-text")
+        terminal = event("response.completed", response={"status": "completed"})
+
+        def chunks(_):
+            yield tool
+            time.sleep(0.12)
+            yield text + terminal
+
+        self.relay_response(chunks, tool + text + terminal, 1)
+        logs = "\n".join(call.args[0] for call in self.logs.call_args_list)
+        self.assertEqual(logs.count("first text observed:"), 1)
+        timing = next(line for line in logs.splitlines() if "stream timing:" in line)
+        first_text = float(re.search(r"first_text=([\d.]+)s", timing).group(1))
+        gap = float(re.search(r"max_progress_gap=([\d.]+)s", timing).group(1))
+        self.assertGreaterEqual(first_text, 0.1)
+        self.assertGreaterEqual(gap, 0.1)
+        self.assertIn("downstream_write=", timing)
+        self.assertIn("max_write=", timing)
+        self.assertIn("headers_wait=", logs)
+        self.assertIn("upload=", logs)
+        self.assertNotIn("private-body-text", logs)
+        self.assertNotIn("private-tool-arguments", logs)
+
+    def test_timing_preserves_failed_attempt_phase_and_non_text_response(self):
+        with upstream([event("response.created", response={})], hold=True):
+            result = self.attempt(deadline=0.15)
+            self.assertEqual(result[0], "retry")
+        logs = "\n".join(call.args[0] for call in self.logs.call_args_list)
+        self.assertIn("attempt timing: phase=first_output", logs)
+        self.assertIn("retained=False", logs)
+        self.relay_response([b'{"ok":true}'], b'{"ok":true}', 1, content_type="application/json")
+        logs = "\n".join(call.args[0] for call in self.logs.call_args_list)
+        self.assertIn("first_text=unavailable", logs)
+        self.assertNotIn("first text observed:", logs)
+
     def test_deadline_interrupts_blocked_read(self):
         with upstream([event("response.created", response={})], hold=True):
             started = time.monotonic()
@@ -142,8 +182,9 @@ class StreamingTest(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1)
 
     def relay_response(self, chunks, expected, expected_calls, status=200, retry_after=None, settings=None,
-                       headers=None, body=b"{}", path="/responses", content_type="text/event-stream"):
-        with upstream(chunks, content_type=content_type, retry_after=retry_after) as calls:
+                       headers=None, body=b"{}", path="/responses", content_type="text/event-stream",
+                       chunked=False):
+        with upstream(chunks, content_type=content_type, retry_after=retry_after, chunked=chunked) as calls:
             for name, value in (settings or {}).items():
                 setattr(relay.ARGS, name, value)
             with patch.object(relay, "REQUEST_SEM", threading.BoundedSemaphore(4)):
@@ -202,8 +243,37 @@ class StreamingTest(unittest.TestCase):
         self.assertTrue(any("terminal=response.failed" in call.args[0]
                             for call in self.logs.call_args_list))
 
+    def test_truncated_chunk_records_exception_type_and_io_stage_without_replay(self):
+        output = event("response.output_text.delta", delta="partial")
+        framed_output = f"{len(output):x}\r\n".encode() + output + b"\r\n"
+        self.relay_response([framed_output, b"10\r\nshort"], output + b"short", 1, chunked=True)
+        summaries = [call.args[0] for call in self.logs.call_args_list if "stream ended:" in call.args[0]]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("reason=stream_io_error; terminal=none", summaries[0])
+        self.assertIn("error_type=IncompleteRead", summaries[0])
+        self.assertIn("io_stage=upstream_read", summaries[0])
+
     def test_relay_bounds_empty_stream_failures(self):
         self.relay_response([], b"relay: upstream stream ended before output\n", 3, status=502)
+
+    def test_transport_failures_back_off_before_repeating(self):
+        with patch.object(relay.random, "uniform", return_value=1):
+            started = time.monotonic()
+            self.relay_response([], b"relay: upstream stream ended before output\n", 3, status=502,
+                                settings={"backoff_base": 0.05, "backoff_max": 0.1})
+        self.assertGreaterEqual(time.monotonic() - started, 0.15)
+        logs = "\n".join(call.args[0] for call in self.logs.call_args_list)
+        self.assertIn("delay=0.050s; reason=transport_502", logs)
+        self.assertIn("delay=0.100s; reason=transport_502", logs)
+        self.assertNotIn("immediate retry", logs)
+
+    def test_retry_wait_exceeding_remaining_budget_does_not_resubmit(self):
+        overload = event("error", error={"code": "server_is_overloaded"})
+        with patch.object(relay.random, "uniform", return_value=1):
+            self.relay_response([overload], overload, 1,
+                                settings={"total_budget": 0.2, "backoff_base": 0.5, "backoff_max": 4})
+        self.assertTrue(any("retry wait exceeds cap or remaining budget" in call.args[0]
+                            for call in self.logs.call_args_list))
 
     def test_long_retry_after_returns_without_waiting(self):
         overload = event("error", error={"code": "server_is_overloaded"})
@@ -294,7 +364,8 @@ class StreamingTest(unittest.TestCase):
         headers = {"x-codex-turn-metadata": json.dumps({"request_kind": "turn"})}
         self.relay_response(
             chunks, b"relay: timed out waiting for upstream output\n", 1, status=502, headers=headers,
-            settings={"total_budget": 0.15, "commit_deadline": 0.15, "compaction_timeout": 1},
+            settings={"total_budget": 0.15, "commit_deadline": 0.15, "compaction_timeout": 1,
+                      "max_attempts": 1},
         )
         self.assertTrue(any("kind=turn; source=header" in call.args[0] for call in self.logs.call_args_list))
 

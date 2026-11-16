@@ -22,6 +22,7 @@ import socket
 import sys
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import urlsplit
@@ -428,6 +429,7 @@ class StreamObserver:
         self.parser = SSEParser() if is_sse else None
         self.terminal = "none"
         self.inspection = "sse" if is_sse else "opaque"
+        self.text_seen = False
 
     def feed(self, chunk):
         if self.parser is None:
@@ -446,6 +448,8 @@ class StreamObserver:
                 if _classify_event_document(evt)[0] is not None:
                     progress = True
                 kind = evt.get("type") if isinstance(evt, dict) else None
+                if kind == "response.output_text.delta" and evt.get("delta"):
+                    self.text_seen = True
                 if isinstance(kind, str) and kind in TERMINAL_EVENTS:
                     self.terminal = kind
             pending = len(self.parser.line) + sum(map(len, self.parser.data))
@@ -515,6 +519,24 @@ class ConnectionWatch:
             return
 
 
+def retry_delay(attempt_no, base, cap, retry_after=""):
+    """Bound exponential jitter; return None rather than violate a server retry deadline."""
+    delay = min(cap, base * (2 ** min(attempt_no - 1, 100)))
+    delay = min(cap, delay * random.uniform(0.7, 1.3))
+    if retry_after:
+        try:
+            if retry_after.strip().isdecimal():
+                required = int(retry_after.strip())
+            else:
+                required = max(0.0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            required = 0.0
+        if required > cap:
+            return None
+        delay = max(delay, required)
+    return delay
+
+
 def attempt(path, headers, body, timeout, commit_by, cancelled=lambda: False, request_id=None):
     """Return mode/status/headers/body/connection/response for one attempt.
 
@@ -524,11 +546,22 @@ def attempt(path, headers, body, timeout, commit_by, cancelled=lambda: False, re
     conn = upstream_connection(timeout)
     watch = ConnectionWatch(conn, cancelled, commit_by, request_id=request_id)
     retained = False
+    attempt_started = time.monotonic()
+    connected_at = uploaded_at = headers_at = None
+    phase = "connect"
     try:
         with watch:
-            conn.request("POST", path, body=body, headers=headers)
+            conn.connect()
+            connected_at = time.monotonic()
             conn._relay_socket = conn.sock
+            phase = "upload"
+            conn.request("POST", path, body=body, headers=headers)
+            uploaded_at = time.monotonic()
+            conn._relay_socket = conn.sock
+            phase = "response_headers"
             resp = conn.getresponse()
+            headers_at = time.monotonic()
+            phase = "first_output"
             conn._relay_response = resp
             response_headers = dict(resp.getheaders())
             if resp.status != 200:
@@ -619,6 +652,16 @@ def attempt(path, headers, body, timeout, commit_by, cancelled=lambda: False, re
                    if reason == "precommit_deadline" else b"relay: upstream connection interrupted\n")
         return "retry", 502, {}, message, None, "transport_502"
     finally:
+        def elapsed(end, start):
+            return f"{end - start:.3f}s" if end is not None and start is not None else "unavailable"
+
+        prefix = f"[{request_id}] " if request_id is not None else ""
+        log(f"{prefix}attempt timing: phase={phase}; "
+            f"connect={elapsed(connected_at, attempt_started)}; "
+            f"upload={elapsed(uploaded_at, connected_at)}; "
+            f"headers_wait={elapsed(headers_at, uploaded_at)}; "
+            f"after_headers={elapsed(time.monotonic(), headers_at)}; "
+            f"elapsed={time.monotonic() - attempt_started:.3f}s; retained={retained}")
         if not retained:
             close_upstream(conn)
 
@@ -737,7 +780,6 @@ class Handler(BaseHTTPRequestHandler):
         deadline = started + total_budget
         last = None
         attempts = 0
-        transport_grace = False
         transport_failures = 0
         for attempt_no in range(1, ARGS.max_attempts + 1):
             remaining = deadline - time.monotonic()
@@ -776,23 +818,15 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"[{cport}] transport 502 consecutive retry limit reached; passthrough")
                 self._send_simple(status, resp_headers, prelude)
                 return
-            transport_grace = resp == "transport_502"
             if attempt_no == ARGS.max_attempts:
                 break
-            if transport_grace:
-                delay = 0.0
-                log(f"[{cport}] transport 502: immediate retry grace")
-            else:
-                delay = min(ARGS.backoff_max, ARGS.backoff_base * (1.6 ** min(attempt_no - 1, 100)))
-                delay = min(ARGS.backoff_max, delay * random.uniform(0.7, 1.3))
             retry_after = next((v for k, v in resp_headers.items() if k.lower() == "retry-after"), "")
-            if retry_after.isdecimal():
-                if int(retry_after) > ARGS.backoff_max:
-                    log(f"[{cport}] Retry-After exceeds fast retry limit; returning upstream failure")
-                    self._send_simple(status, resp_headers, prelude)
-                    return
-                delay = max(delay, int(retry_after))
-            wait_until = min(deadline, time.monotonic() + delay)
+            delay = retry_delay(attempt_no, ARGS.backoff_base, ARGS.backoff_max, retry_after)
+            if delay is None or delay >= deadline - time.monotonic():
+                log(f"[{cport}] retry wait exceeds cap or remaining budget; returning upstream failure")
+                break
+            log(f"[{cport}] backoff before attempt {attempt_no + 1}: delay={delay:.3f}s; reason={resp}")
+            wait_until = time.monotonic() + delay
             while time.monotonic() < wait_until:
                 if self._client_gone():
                     log(f"[{cport}] cancelled during backoff")
@@ -847,6 +881,9 @@ class Handler(BaseHTTPRequestHandler):
         io_timeout = ARGS.timeout if io_timeout is None else io_timeout
         forwarded = 0
         outcome = "upstream_eof"
+        error_type = "none"
+        error_number = None
+        io_stage = "response_headers"
         content_type = next((value for key, value in resp_headers.items()
                              if key.lower() == "content-type"), "")
         encoding = next((value for key, value in resp_headers.items()
@@ -854,8 +891,39 @@ class Handler(BaseHTTPRequestHandler):
         is_sse = (content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
                   and encoding.strip().lower() in ("", "identity"))
         observer = StreamObserver(is_sse)
+        last_progress = stream_started
+        max_progress_gap = 0.0
+        upstream_read_time = inspection_time = write_time = max_write_time = 0.0
+        first_text = None
+
+        def inspect_chunk(chunk):
+            nonlocal last_progress, max_progress_gap, inspection_time, first_text
+            before = time.monotonic()
+            progress = observer.feed(chunk)
+            now = time.monotonic()
+            inspection_time += now - before
+            if progress:
+                max_progress_gap = max(max_progress_gap, now - last_progress)
+                last_progress = now
+            if observer.text_seen and first_text is None:
+                first_text = now - started
+                log(f"[{self.client_address[1]}] first text observed: elapsed={first_text:.3f}s")
+            return progress
+
+        def write_chunk(chunk):
+            nonlocal forwarded, write_time, max_write_time
+            before = time.monotonic()
+            try:
+                self.wfile.write(chunk)
+                forwarded += len(chunk)
+                self.wfile.flush()
+            finally:
+                duration = time.monotonic() - before
+                write_time += duration
+                max_write_time = max(max_write_time, duration)
+
         # Reparse the preserved head, including any partial following event.
-        observer.feed(prelude)
+        inspect_chunk(prelude)
         watch = ConnectionWatch(
             conn, self._client_gone, time.monotonic() + idle_timeout,
             timeout_reason="stream_idle_timeout", request_id=self.client_address[1],
@@ -872,21 +940,26 @@ class Handler(BaseHTTPRequestHandler):
                 stream_socket = getattr(conn, "_relay_socket", None) or conn.sock
                 if stream_socket is not None:
                     stream_socket.settimeout(io_timeout)
-                self.wfile.write(prelude)
-                forwarded += len(prelude)
-                self.wfile.flush()
+                io_stage = "downstream_write"
+                write_chunk(prelude)
                 while True:
-                    chunk = resp.read1(65536)
+                    io_stage = "upstream_read"
+                    before_read = time.monotonic()
+                    try:
+                        chunk = resp.read1(65536)
+                    finally:
+                        upstream_read_time += time.monotonic() - before_read
                     watch.check_interrupted()
                     if not chunk:
                         break
-                    if observer.feed(chunk):
+                    if inspect_chunk(chunk):
                         watch.deadline = time.monotonic() + idle_timeout
-                    self.wfile.write(chunk)
-                    forwarded += len(chunk)
-                    self.wfile.flush()
+                    io_stage = "downstream_write"
+                    write_chunk(chunk)
         except (OSError, http.client.HTTPException) as exc:
             outcome = watch.reason or ("socket_timeout" if isinstance(exc, socket.timeout) else "stream_io_error")
+            error_type = type(exc).__name__
+            error_number = getattr(exc, "errno", None)
         finally:
             outcome = watch.reason or outcome
             if observer.terminal == "response.completed" and outcome in ("upstream_eof", "client_cancelled"):
@@ -894,7 +967,15 @@ class Handler(BaseHTTPRequestHandler):
             log(f"[{self.client_address[1]}] stream ended: reason={outcome}; terminal={observer.terminal}; "
                 f"forwarded={forwarded}B; elapsed={time.monotonic() - started:.1f}s; "
                 f"streaming={time.monotonic() - stream_started:.1f}s; inspection={observer.inspection}; "
+                f"error_type={error_type}; errno={error_number}; io_stage={io_stage}; "
                 "no relay replay")
+            first_text_value = f"{first_text:.3f}s" if first_text is not None else "unavailable"
+            log(f"[{self.client_address[1]}] stream timing: first_text={first_text_value}; "
+                f"max_progress_gap={max_progress_gap:.3f}s; "
+                f"since_last_progress={time.monotonic() - last_progress:.3f}s; "
+                f"upstream_read={upstream_read_time:.3f}s; inspection={inspection_time:.3f}s; "
+                f"downstream_write={write_time:.3f}s; max_write={max_write_time:.3f}s; "
+                f"inspection_mode={observer.inspection}")
             close_upstream(conn)
 
     def _send_simple(self, status, headers, data):
@@ -964,10 +1045,10 @@ def main():
     )
     p.add_argument("--clash-host", choices=("127.0.0.1", "localhost"), default="127.0.0.1")
     p.add_argument("--max-attempts", type=int, default=10)
-    p.add_argument("--total-budget", type=float, default=20.0)
-    p.add_argument("--backoff-base", type=float, default=0.2)
-    p.add_argument("--backoff-max", type=float, default=0.5)
-    p.add_argument("--commit-deadline", type=float, default=20.0,
+    p.add_argument("--total-budget", type=float, default=60.0)
+    p.add_argument("--backoff-base", type=float, default=0.5)
+    p.add_argument("--backoff-max", type=float, default=4.0)
+    p.add_argument("--commit-deadline", type=float, default=60.0,
                    help="max seconds per attempt to wait for substantive output")
     p.add_argument("--stream-idle-timeout", type=float, default=30.0,
                    help="max seconds without output progress after committing a stream")

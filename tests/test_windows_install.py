@@ -30,7 +30,7 @@ class WindowsInstallTest(unittest.TestCase):
         self.project = self.root / "project"
         (self.project / "scripts").mkdir(parents=True)
         (self.project / "relay").mkdir()
-        for name in ("install.ps1", "uninstall.ps1"):
+        for name in ("install.ps1", "uninstall.ps1", "switch.ps1", "switch_config.py"):
             shutil.copyfile(REPOSITORY / "scripts" / name, self.project / "scripts" / name)
         (self.project / "relay" / "relay.py").write_text("# isolated fixture\n", encoding="utf-8")
         (self.project / "scripts" / "watch.ps1").write_text(
@@ -195,7 +195,7 @@ ConvertTo-Json -InputObject @($global:relayTestOperations) -Compress
 
     def test_powershell_scripts_parse(self):
         output = self.powershell("""
-foreach ($name in @('install.ps1', 'uninstall.ps1')) {
+foreach ($name in @('install.ps1', 'uninstall.ps1', 'switch.ps1')) {
     $tokens = $null
     $errors = $null
     $path = Join-Path $env:RELAY_TEST_PROJECT ('scripts/' + $name)
@@ -205,6 +205,34 @@ foreach ($name in @('install.ps1', 'uninstall.ps1')) {
 'PARSE_OK'
 """)
         self.assertIn("PARSE_OK", output)
+
+    def test_direct_switch_disables_owned_task_and_preserves_other_config(self):
+        self.install()
+        config = self.project / "config.toml"
+        config.write_text(
+            'model_provider = "openai-retry"\n[model_providers.openai-retry]\n'
+            'base_url = "http://127.0.0.1:28787"\n[other]\nvalue = "keep"\n', encoding="utf-8")
+        output = self.powershell("""
+function Get-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskName)
+    [PSCustomObject]@{ Actions = @([PSCustomObject]@{ Execute = 'wscript.exe';
+        Arguments = '//B "' + (Join-Path $env:RELAY_TEST_STATE 'start-relay.vbs') + '"' }) }
+}
+function Disable-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskName)
+    'DISABLED_OWNED_TASK' | Write-Host
+}
+function Stop-ScheduledTask { [CmdletBinding()] param([string]$TaskName) }
+function Get-ItemProperty { [CmdletBinding()] param([string]$Path, [string]$Name) }
+function Get-CimInstance { [CmdletBinding()] param([string]$ClassName) }
+& (Join-Path $env:RELAY_TEST_PROJECT 'scripts/switch.ps1') -Mode Direct `
+    -StateDir $env:RELAY_TEST_STATE -ConfigPath (Join-Path $env:RELAY_TEST_PROJECT 'config.toml')
+""")
+        self.assertIn("DISABLED_OWNED_TASK", output)
+        self.assertIn('base_url = "https://chatgpt.com/backend-api/codex"', config.read_text())
+        self.assertIn('value = "keep"', config.read_text())
+        self.assertTrue((self.state / "install.json").exists())
+        self.assertEqual(len(list(self.project.glob("config.toml.*.bak"))), 1)
 
 
 if __name__ == "__main__":
